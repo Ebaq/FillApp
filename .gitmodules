@@ -1,3 +1,3 @@
 [submodule "FillAppFrontend"]
-	path = FillAppFrontend
+	path = frontend
 	url = https://github.com/Ebaq/FillAppFrontend
