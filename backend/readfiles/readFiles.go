@@ -6,10 +6,10 @@ import (
 	"fillappgo/backend/Errors"
 	"fillappgo/backend/consts"
 	"fmt"
-	"github.com/xbmlz/uniconv"
 	"github.com/xuri/excelize/v2"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -34,7 +34,6 @@ func ReadXlsx(path string, dayOfWeek string, logger *log.Logger) error {
 	}
 
 	defer func() {
-		println("closing file")
 		if err := file.Close(); err != nil {
 			logger.Printf("Ошибка при закрытии накладной XLSX: %v\n", err)
 			fmt.Println(err)
@@ -65,7 +64,10 @@ func ReadXlsx(path string, dayOfWeek string, logger *log.Logger) error {
 	close(productsChan)
 	close(standardChan)
 
-	printVars()
+	for _, prod := range Products {
+		println(prod.Name, prod.Amount)
+	}
+
 	return nil
 }
 
@@ -75,7 +77,7 @@ func findAllProducts(rows [][]string, productsChan chan<- consts.Products) {
 	for _, row := range rows[10:] {
 		if len(row) > 7 && row[0] != "0" && row[1] != "" && row[0] != "" && row[7] != "" {
 			if amount, err := strconv.ParseFloat(row[7], 4); err == nil && amount > 0 {
-				if ind, isContains := products.Contains(row[0]); isContains {
+				if ind, isContains := products.Contains(row[1]); isContains {
 					am, _ := strconv.ParseFloat(strings.TrimSpace(row[7]), 64)
 					products[ind].Amount += am
 
@@ -108,84 +110,27 @@ std:
 	}
 }
 
-func printVars() {
-	println("Products")
-	for _, prod := range Products {
-		println(prod.Name, strconv.FormatFloat(prod.Amount, 'f', 4, 64))
-	}
-	println("Standard", Standard)
-
-	println(len(Products))
-}
-
 // ReadXls TODO: Доделать функцию и добавить логи
 func ReadXls(path string, logger *log.Logger) error {
-	productsChan := make(chan consts.Products)
-	//amountsChan := make(chan []float64)
-	standardChan := make(chan string)
-	p := uniconv.NewProcessor()
-	logger.Println("Открытие конвертирования накладной XLS в XLSX")
-	p.Start()
-	defer p.Stop()
+	absPath, _ := filepath.Abs(path)
+	wd, _ := os.Getwd()
+	cmd := exec.Command("./shared/xls.exe", absPath)
+	cmd.Dir = wd
 
-	c := uniconv.NewConverter()
-
-	parts := strings.Split(path, "\\")
-	fmt.Println(len(parts))
-	fmt.Printf("parts before: %s\n", strings.Join(parts, "\\"))
-	parts = parts[:len(parts)-1]
-	parts = append(parts, `xlsx`)
-	dir := strings.Join(parts, "\\")
-
-	err := c.Convert(path, fmt.Sprintf("%s\\out.xlsx", dir))
+	//println(cmd.Dir)
+	logger.Printf("Рабочая директория: %s", cmd.Dir)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		logger.Printf("Ошибка при конвертировании накладной XLS: %v\n", err)
-		return fmt.Errorf(Errors.NewProgramError("1X1", "read", "Не удалось конвертировать накладную в формат XLSX"))
+		println(err.Error())
 	}
 
-	file, err := excelize.OpenFile(fmt.Sprintf("%s\\out.xlsx", dir))
-	if err != nil {
-		fmt.Println(err)
-		logger.Printf("Ошибка при открытии накладной XLSX: %v\n", err)
-		return fmt.Errorf(Errors.NewProgramError("1X2", "read", "Не удалось открыть накладную"))
-	}
-	if err := file.SaveAs(path[:len(path)-5] + "-copy.xlsx"); err != nil {
-		fmt.Println(err)
-		//return fmt.Errorf(Errors.NewProgramError("0X2", "read", "Не удалось сохранить копию файла"))
-	}
-	defer func() {
-		println("closing file")
-		if err := file.Close(); err != nil {
-			logger.Printf("Ошибка при закрытии накладной XLS: %v\n", err)
-			fmt.Println(err)
-		}
-	}()
+	var res consts.PythonResult
 
-	rows, err := file.GetRows("Накладная")
-
-	if err != nil {
-		logger.Printf("Ошибка при чтении строк накладной XLS: %v\n", err)
-		fmt.Println(err, "Closing file")
-		file.Close()
-		return fmt.Errorf(Errors.NewProgramError("1X3", "read", "Не удалось прочитать файл"))
-		//return fmt.Errorf(Errors.NewProgramError("0X3", "read", "Не удалось прочитать файл"))
+	if err := json.Unmarshal(out, &res); err != nil {
+		println(err.Error())
 	}
-
-	logger.Println("Начало поиска нормы и продуктов накландой XLS")
-	go findAllProducts(rows, productsChan)
-	go findStandard(rows, standardChan)
-
-	for i := 0; i < 2; i++ {
-		select {
-		case prod := <-productsChan:
-			ProductsGuard = prod
-		case std := <-standardChan:
-			StandardGuard = std
-		}
-	}
-	close(productsChan)
-	close(standardChan)
-	printVars()
+	ProductsGuard = res.Products
+	StandardGuard = res.Standard
 	return nil
 }
 
@@ -198,7 +143,7 @@ func ReadDictionary(logger *log.Logger) (consts.Dictionaries, error) {
 	}
 
 	programDir := filepath.Dir(execPath)
-	dictFilePath := filepath.Join(programDir, consts.DictionaryName)
+	dictFilePath := filepath.Join(programDir, "shared", consts.DictionaryName)
 
 	b, err := os.ReadFile(dictFilePath)
 
@@ -219,13 +164,14 @@ func ReadDictionary(logger *log.Logger) (consts.Dictionaries, error) {
 func ParseErrors(products consts.Products, logger *log.Logger) (consts.Products, error) {
 	dict, err := ReadDictionary(logger)
 	p := products
+	mappedErrors := dict.ToMap()
 
 	if err != nil {
 		return products, err
 	}
 
 	for i, product := range p {
-		if original, isContains := dict.Contains(product.Name); isContains {
+		if original, isContains := dict.ContainsMap(product.Name, mappedErrors); isContains {
 			p[i].Name = original
 		}
 	}

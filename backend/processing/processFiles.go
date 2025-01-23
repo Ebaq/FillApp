@@ -1,14 +1,21 @@
 package processing
 
 import (
+	"encoding/json"
 	"fillappgo/backend/Errors"
 	"fillappgo/backend/consts"
 	"fillappgo/backend/readfiles"
+	"fillappgo/backend/shared"
 	"fmt"
 	"github.com/xuri/excelize/v2"
 	"log"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var GuardProducts = consts.Products{
@@ -44,8 +51,52 @@ var GuardProducts = consts.Products{
 	},
 }
 
+var filterProducts = consts.Products{{
+	Name:     "Капуста белокочанная свежая",
+	Amount:   0,
+	IsParsed: false,
+}, {
+	Name:     "Капуста белокочанная маринованная",
+	Amount:   0,
+	IsParsed: false,
+}, {
+	Name:     "Капуста белокочанная сушеная",
+	Amount:   0,
+	IsParsed: false,
+}, {
+	Name:     "Капуста белокочанная квашеная",
+	Amount:   0,
+	IsParsed: false,
+}, {
+	Name:     "Лук репчатый свежий",
+	Amount:   0,
+	IsParsed: false,
+}, {
+	Name:     "Лук репчатый сушеный",
+	Amount:   0,
+	IsParsed: false,
+}}
+
+var literProducts = consts.Products{{
+	Name:     "Молоко 3,2%",
+	Amount:   1,
+	IsParsed: false,
+}, {
+	Name:     "Молоко 3,2% /ФилВоенторг/ 0,200л",
+	Amount:   0.2,
+	IsParsed: false,
+}, {
+	Name:     "Сок фруктово-ягодный/ФилВоенторг/1,000л/1шт",
+	Amount:   1,
+	IsParsed: false,
+}, {
+	Name:     "Сок фруктово-ягодный /ФилВоенторг/ 0,200л",
+	Amount:   0.2,
+	IsParsed: false,
+}}
+
 // ProcessBook Обработка книги и запуск внесения значений
-func ProcessBook(Book string, date string, logger *log.Logger) ([]string, error) {
+func ProcessBook(Book string, date string, logger *log.Logger) ([]string, []string, error) {
 	defer func() {
 		if err := recover(); err != nil {
 			fmt.Println(err)
@@ -68,14 +119,13 @@ func ProcessBook(Book string, date string, logger *log.Logger) ([]string, error)
 	wb, err := excelize.OpenFile(Book)
 	if err != nil {
 		logger.Printf("Ошибка при открытии файла книги: %v\n", err)
-		return nil, fmt.Errorf(Errors.NewProgramError("0X1", "processing", "Не удалось открыть файл"))
+		return nil, nil, fmt.Errorf(Errors.NewProgramError("0X1", "processing", "Не удалось открыть файл"))
 	}
-	if err := wb.SaveAs(Book[:len(Book)-5] + "-copy.xlsx"); err != nil {
+	if err := wb.SaveAs(Book[:len(Book)-5] + "-КОПИЯ.xlsx"); err != nil {
 		logger.Printf("Ошибка при сохранении файла книги: %v\n", err)
-		return nil, fmt.Errorf(Errors.NewProgramError("0X2", "processing", "Не удалось сохранить копию файла"))
+		return nil, nil, fmt.Errorf(Errors.NewProgramError("0X2", "processing", "Не удалось сохранить копию файла"))
 	}
 	defer func() {
-		println("closing wb")
 		if err := wb.Close(); err != nil {
 			logger.Printf("Ошибка при закрытии файла книги: %v\n", err)
 			fmt.Println(err)
@@ -89,7 +139,7 @@ func ProcessBook(Book string, date string, logger *log.Logger) ([]string, error)
 		fmt.Println(err, "Closing wb")
 		logger.Printf("Ошибка при чтении строк книги: %v\n", err)
 		wb.Close()
-		return nil, fmt.Errorf(Errors.NewProgramError("0X3", "processing", "Не удалось прочитать файл"))
+		return nil, nil, fmt.Errorf(Errors.NewProgramError("0X3", "processing", "Не удалось прочитать файл"))
 	}
 
 	logger.Println("Начало поиска строки с нормой")
@@ -107,7 +157,7 @@ func ProcessBook(Book string, date string, logger *log.Logger) ([]string, error)
 
 	if standardRow == -1 {
 		logger.Println("Не была найдена строка с нормой")
-		return nil, fmt.Errorf(Errors.NewProgramError("0X4", "processing", "Не удалось найти строку с нужной нормой"))
+		return nil, nil, fmt.Errorf(Errors.NewProgramError("0X4", "processing", "Не удалось найти строку с нужной нормой"))
 	}
 
 	logger.Println("Начало записи количества продуктов в книгу")
@@ -117,7 +167,25 @@ func ProcessBook(Book string, date string, logger *log.Logger) ([]string, error)
 // Поиск строки с нужной нормой и датой
 func findStandardRow(rows [][]string, date string, standard string, c chan<- int) int {
 	resIndex := -1
-	dateIndex := 0
+	dateIndex := findDateRow(rows, date)
+
+	for i, row := range rows[dateIndex:len(rows)] {
+		if len(row) > 0 {
+			if strings.Contains(row[0], standard) {
+				resIndex = dateIndex + i + 1
+				break
+			}
+		}
+	}
+
+	if c != nil {
+		c <- resIndex
+	}
+
+	return resIndex
+}
+
+func findDateRow(rows [][]string, date string) (dateIndex int) {
 	//TODO: Оптимизировать, начиная с конца, если дата > 15
 	//if day > 15 {
 	//	for i := len(rows) - 1; i >= 0; i-- {
@@ -131,7 +199,6 @@ func findStandardRow(rows [][]string, date string, standard string, c chan<- int
 	//} else {
 	for i, row := range rows {
 		if len(row) > 0 {
-			println("row", row[0])
 			if row[0] == date {
 				dateIndex = i
 				break
@@ -139,59 +206,55 @@ func findStandardRow(rows [][]string, date string, standard string, c chan<- int
 		}
 	}
 	//}
-
-	for i, row := range rows[dateIndex:len(rows)] {
-		if strings.Contains(row[0], standard) {
-			resIndex = dateIndex + i + 1
-			break
-		}
-	}
-
-	if c != nil {
-		c <- resIndex
-	}
-
-	return resIndex
+	return
 }
 
 // Внесение количества продукта в ячейку с нормой под продуктом
-func writeAmounts(wb *excelize.File, Book string, rows [][]string, logger *log.Logger, products consts.Products, guardProducts consts.Products, standardRow int, standardGuardRow int) ([]string, error) {
+func writeAmounts(wb *excelize.File, Book string, rows [][]string, logger *log.Logger, products consts.Products, guardProducts consts.Products, standardRow int, standardGuardRow int) ([]string, []string, error) {
 	k := len(rows[1]) - 5
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Printf("Ошибка в writeAmounts: %s", err)
+		}
+	}()
 
-	println("starting parsing rows")
+	mappedProducts := products.ToMap()
+	mappedGuardProducts := guardProducts.ToMap()
+
 	for i := 1; i < len(rows[1]); i += 5 {
 
 		if k < i {
 			break
 		}
 
-		productIndex, isContains := products.Contains(strings.TrimSpace(rows[1][i]))
-		productKIndex, kIsContains := products.Contains(strings.TrimSpace(rows[1][k]))
+		productIndex, isContains := products.ContainsMap(strings.TrimSpace(rows[1][i]), mappedProducts)
+		productKIndex, kIsContains := products.ContainsMap(strings.TrimSpace(rows[1][k]), mappedProducts)
 
-		guardProductIndex, guardIsContains := guardProducts.Contains(strings.TrimSpace(rows[1][i]))
-		guardProductKIndex, kGuardIsContains := guardProducts.Contains(strings.TrimSpace(rows[1][k]))
+		guardProductIndex, guardIsContains := guardProducts.ContainsMap(strings.TrimSpace(rows[1][i]), mappedGuardProducts)
+		guardProductKIndex, kGuardIsContains := guardProducts.ContainsMap(strings.TrimSpace(rows[1][k]), mappedGuardProducts)
 
 		if isContains {
 			cell, _ := excelize.CoordinatesToCellName(i+3, standardRow)
-			wb.SetCellFloat(consts.DefaultSheet, cell, products[productIndex].Amount, 4, 64)
+			wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(products[productIndex].Amount))
 			products[productIndex].IsParsed = true
 		}
 
 		if kIsContains {
 			cell, _ := excelize.CoordinatesToCellName(k+3, standardRow)
-			wb.SetCellFloat(consts.DefaultSheet, cell, products[productKIndex].Amount, 4, 64)
+			wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(products[productKIndex].Amount))
 			products[productKIndex].IsParsed = true
 		}
 
 		if guardIsContains {
 			cell, _ := excelize.CoordinatesToCellName(i+3, standardGuardRow)
-			wb.SetCellFloat(consts.DefaultSheet, cell, guardProducts[guardProductIndex].Amount, 4, 64)
+			wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(guardProducts[guardProductIndex].Amount))
 			guardProducts[guardProductIndex].IsParsed = true
 		}
 
 		if kGuardIsContains {
 			cell, _ := excelize.CoordinatesToCellName(k+3, standardGuardRow)
-			wb.SetCellFloat(consts.DefaultSheet, cell, guardProducts[guardProductKIndex].Amount, 4, 64)
+			wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(guardProducts[guardProductKIndex].Amount))
+			guardProducts[guardProductKIndex].IsParsed = true
 		}
 
 		k -= 5
@@ -200,18 +263,16 @@ func writeAmounts(wb *excelize.File, Book string, rows [][]string, logger *log.L
 	logger.Println("Сохранении книги")
 	err := wb.SaveAs(Book)
 
+	logger.Println("Пересчет формул")
+	RunPythonSave(Book)
+
 	if err != nil {
 		logger.Printf("Ошибка при сохранении книги: %v\n", err)
-		return nil, fmt.Errorf(Errors.NewProgramError("2X1", "processing", "Не удалось сохранить книгу"))
-	}
-
-	logger.Println("Сохранении измененной копии книги")
-	err = wb.SaveAs(Book[:len(Book)-5] + "-edited-copy.xlsx")
-	if err != nil {
-		logger.Printf("Ошибка при сохранении измененной копии книги: %v\n", err)
+		return nil, nil, fmt.Errorf(Errors.NewProgramError("2X1", "processing", "Не удалось сохранить книгу"))
 	}
 
 	var unusedProducts []string
+	var unusedGuardProducts []string
 
 	for _, prod := range products {
 		if !prod.IsParsed {
@@ -219,7 +280,14 @@ func writeAmounts(wb *excelize.File, Book string, rows [][]string, logger *log.L
 		}
 	}
 
-	return unusedProducts, nil
+	for _, prod := range guardProducts {
+		if !prod.IsParsed {
+			unusedGuardProducts = append(unusedGuardProducts, prod.Name)
+		}
+	}
+
+	logger.Printf("Products: %v Guard: %v", unusedProducts, unusedGuardProducts)
+	return unusedProducts, unusedGuardProducts, nil
 }
 
 // SetGuardAndCaramel Открытие книги и запуск внесения караула и карамели
@@ -255,12 +323,11 @@ func SetGuardAndCaramel(Book string, caramelAmount string, date string, logger *
 		logger.Printf("Ошибка при открытии книги: %v\n", err)
 		return fmt.Errorf(Errors.NewProgramError("1X1", "processing", "Не удалось открыть файл"))
 	}
-	if err := wb.SaveAs(Book[:len(Book)-5] + "-copy.xlsx"); err != nil {
+	if err := wb.SaveAs(Book[:len(Book)-5] + "-КОПИЯ.xlsx"); err != nil {
 		logger.Printf("Ошибка при сохранении копии книги: %v\n", err)
 		return fmt.Errorf(Errors.NewProgramError("1X2", "processing", "Не удалось сохранить копию файла"))
 	}
 	defer func() {
-		println("closing wb")
 		logger.Println("Закрытии книги")
 		if err := wb.Close(); err != nil {
 			logger.Printf("Ошибка при закрытии книги: %v\n", err)
@@ -318,11 +385,8 @@ func SetGuardAndCaramel(Book string, caramelAmount string, date string, logger *
 		logger.Printf("Ошибка при сохранении книги: %v\n", err)
 		return err
 	}
-	err = wb.SaveAs(Book[:len(Book)-5] + "-edited-copy.xlsx")
-	if err != nil {
-		logger.Printf("Ошибка при сохранении измененной копии книги: %v\n", err)
-		return fmt.Errorf(Errors.NewProgramError("1X6", "processing", "Не удалось сохранить измененную копию файла"))
-	}
+
+	RunPythonSave(Book)
 
 	return nil
 
@@ -331,20 +395,21 @@ func SetGuardAndCaramel(Book string, caramelAmount string, date string, logger *
 // Внесение количества из караула и внесение карамели в карамель
 func writeGuardAndCaramel(wb *excelize.File, rows [][]string, caramel consts.Products, guardRow int, caramelRow int) error {
 	k := len(rows[1]) - 5
+	mappedProducts := GuardProducts.ToMap()
 
 	for i := 1; i < len(rows[1]); i += 5 {
 
-		productIndex, isContains := GuardProducts.Contains(rows[1][i])
-		productKIndex, kIsContains := GuardProducts.Contains(rows[1][k])
+		productIndex, isContains := GuardProducts.ContainsMap(rows[1][i], mappedProducts)
+		productKIndex, kIsContains := GuardProducts.ContainsMap(rows[1][k], mappedProducts)
 
 		if isContains {
 			cell, _ := excelize.CoordinatesToCellName(i+3, guardRow)
-			wb.SetCellFloat(consts.DefaultSheet, cell, GuardProducts[productIndex].Amount, 4, 64)
+			wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(GuardProducts[productIndex].Amount))
 			GuardProducts[productIndex].IsParsed = true
 		}
 		if kIsContains {
 			cell, _ := excelize.CoordinatesToCellName(k+3, guardRow)
-			wb.SetCellFloat(consts.DefaultSheet, cell, GuardProducts[productKIndex].Amount, 4, 64)
+			wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(GuardProducts[productKIndex].Amount))
 			GuardProducts[productKIndex].IsParsed = true
 		}
 
@@ -353,12 +418,12 @@ func writeGuardAndCaramel(wb *excelize.File, rows [][]string, caramel consts.Pro
 			_, kIsContains := caramel.Contains(rows[1][k])
 			if isContains {
 				cell, _ := excelize.CoordinatesToCellName(i+3, caramelRow)
-				wb.SetCellFloat(consts.DefaultSheet, cell, caramel[0].Amount, 4, 64)
+				wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(caramel[0].Amount))
 				caramel[0].IsParsed = true
 			}
 			if kIsContains {
-				cell, _ := excelize.CoordinatesToCellName(k+3, guardRow)
-				wb.SetCellFloat(consts.DefaultSheet, cell, caramel[0].Amount, 4, 64)
+				cell, _ := excelize.CoordinatesToCellName(k+3, caramelRow)
+				wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(caramel[0].Amount))
 				caramel[0].IsParsed = true
 			}
 		}
@@ -369,12 +434,13 @@ func writeGuardAndCaramel(wb *excelize.File, rows [][]string, caramel consts.Pro
 	return nil
 }
 
-func CreateNewBook(Book string, logger *log.Logger) error {
+func CreateNewBook(Book string, date string, logger *log.Logger) error {
 	defer func() {
 		if err := recover(); err != nil {
 			fmt.Println(err)
 		}
 	}()
+	var wg sync.WaitGroup
 
 	//logger.Println("Начало создания новой книги")
 
@@ -385,12 +451,16 @@ func CreateNewBook(Book string, logger *log.Logger) error {
 		return fmt.Errorf(Errors.NewProgramError("3X1", "processing", "Не удалось открыть файл"))
 	}
 
-	if err := wb.SaveAs(Book[:len(Book)-5] + "-copy.xlsx"); err != nil {
+	if err := wb.SaveAs(Book[:len(Book)-5] + "-КОПИЯ.xlsx"); err != nil {
 		logger.Printf("Ошибка при сохранении файла книги: %v\n", err)
 		return fmt.Errorf(Errors.NewProgramError("3X2", "processing", "Не удалось сохранить копию файла"))
 	}
 
-	if err := wb.SaveAs(Book[:len(Book)-5] + "-new.xlsx"); err != nil {
+	dir := filepath.Dir(Book)
+
+	newBookPath := filepath.Join(dir, "файл для сверки 2-87 ПУСТАЯ.xlsx")
+
+	if err := wb.SaveAs(newBookPath); err != nil {
 		logger.Printf("Ошибка при сохранении файла новой книги: %v\n", err)
 		return fmt.Errorf(Errors.NewProgramError("3X3", "processing", "Не удалось сохранить новую книгу"))
 	}
@@ -405,19 +475,14 @@ func CreateNewBook(Book string, logger *log.Logger) error {
 		return fmt.Errorf(Errors.NewProgramError("3X5", "processing", "Не удалось прочитать файл новой книги"))
 	}
 
-	logger.Println("Начало работы функции getResults")
-	results := getResults(rows, logger)
-
 	logger.Println("Закрытие старой книги")
 	if err := wb.Close(); err != nil {
 		logger.Printf("Ошибка при закрытии файла книги: %v\n", err)
 		fmt.Println(err)
 	}
 
-	newBookPath := Book[:len(Book)-5] + "-new.xlsx"
-
 	logger.Println("Открытие новой книги")
-	wb, err = excelize.OpenFile(newBookPath)
+	newWb, err := excelize.OpenFile(newBookPath)
 
 	if err != nil {
 		logger.Printf("Ошибка при открытии файла новой книги: %v\n", err)
@@ -425,41 +490,336 @@ func CreateNewBook(Book string, logger *log.Logger) error {
 	}
 
 	logger.Println("Начало чтения строк новой книги")
-	rows, err = wb.GetRows(consts.DefaultSheet)
+	rows, err = newWb.GetRows(consts.DefaultSheet)
 
 	if err != nil {
-		fmt.Println(err, "Closing wb")
 		logger.Printf("Ошибка при чтении строк новой книги: %v\n", err)
-		wb.Close()
+		newWb.Close()
 		return fmt.Errorf(Errors.NewProgramError("3X5", "processing", "Не удалось прочитать файл новой книги"))
 	}
 
+	inventRow := findInventRow(rows, date)
+	logger.Println("Начало работы функции getResults")
+	results := getResults(rows, inventRow, logger)
+
+	wg.Add(2)
 	logger.Println("Начало работы функции clearBook")
-	clearBook(wb, rows, results)
+	go clearBook(newWb, rows, results, &wg)
+
+	logger.Println("Начало работы функции replaceNumbers")
+	go replaceNumbers(newWb, inventRow, &wg)
+
+	wg.Wait()
+
+	logger.Println("Сохранение новой книги")
+	if err := newWb.SaveAs(newBookPath); err != nil {
+		logger.Printf("Ошибка при сохранении файла новой книги: %v\n", err)
+		return fmt.Errorf(Errors.NewProgramError("3X3", "processing", "Не удалось сохранить новую книгу"))
+	}
+
+	err = RunPythonSave(newBookPath)
+
+	if err != nil {
+		logger.Printf("Ошибка в пересчете формул: %s", err.Error())
+	}
 
 	return nil
 }
 
-func getResults(rows [][]string, logger *log.Logger) consts.Products {
-	var resultIndex int
+func getResults(rows [][]string, inventRow int, logger *log.Logger) consts.Products {
 	var products consts.Products
 
-	for i := len(rows) - 1; i > 0; i-- {
-		if rows[i][0] == "Итого" {
-			resultIndex = i
+	//TODO: FIX
+	for i := 4; i < len(rows[inventRow])-1; i += 5 {
+		if rows[inventRow][i] != "" {
+			cell, _ := strconv.ParseFloat(rows[inventRow][i], 64)
+			//if cell > 0 {
+			products = append(products, consts.Product{
+				Name:     rows[1][i-3],
+				Amount:   cell,
+				IsParsed: false,
+			})
+		}
+		//}
+	}
+
+	return products
+}
+
+func replaceNumbers(wb *excelize.File, inventRow int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	colIndex := 5
+	referenceRow := inventRow - 1
+	for {
+		// Адрес ячейки для строки с числами
+		targetCell, err := excelize.CoordinatesToCellName(colIndex, inventRow)
+		if err != nil {
+			break // Завершаем цикл, если не удалось получить адрес
+		}
+
+		// Значение в целевой строке
+		cellValue, _ := wb.GetCellValue(consts.DefaultSheet, targetCell)
+
+		// Проверяем условия: не обрабатываем пустые строки, "инвентаризацию" и формулы
+		if cellValue == "" || strings.ToLower(cellValue) == "инвентаризация" || strings.HasPrefix(cellValue, "=") {
+			colIndex += 5
+			continue
+		}
+
+		// Проверяем, является ли значение числом
+		if _, err := strconv.ParseFloat(cellValue, 64); err != nil {
+			colIndex += 5
+			continue
+		}
+
+		// Адрес ячейки в верхней строке
+		referenceCell, _ := excelize.CoordinatesToCellName(colIndex, referenceRow-1)
+
+		// Получаем формулу из верхней строки
+		formula, err := wb.GetCellFormula(consts.DefaultSheet, referenceCell)
+		if err != nil || formula == "" {
+			colIndex += 5
+			continue
+		}
+
+		//println("Формула для ячейки: ", formula)
+
+		// Устанавливаем формулу в текущую ячейку
+		err = wb.SetCellFormula(consts.DefaultSheet, targetCell, fmt.Sprintf(`=%s`, formula))
+
+		colIndex += 5
+	}
+
+}
+
+func clearBook(wb *excelize.File, rows [][]string, results consts.Products, wg *sync.WaitGroup) {
+	defer wg.Done()
+	//for i := 1; i < len(rows[2])-1; i++ {
+	//	if rows[2][i] == "приход" || rows[2][i] == "расход" {
+	//		println(rows[2][i])
+	//		println(len(rows[2][i]))
+	//		println(len(rows))
+	//		for j := 2; j < len(rows)-1; j++ {
+	//			println(rows[j])
+	//			if rows[j][i] != "" {
+	//				cell, _ := excelize.CoordinatesToCellName(i, j)
+	//				wb.SetCellValue(consts.DefaultSheet, cell, "")
+	//			}
+	//		}
+	//	}
+	//	//if k < len(rows[1])-1 {
+	//	//	if index, isContains := results.Contains(rows[1][k]); isContains {
+	//	//		cell, _ := excelize.CoordinatesToCellName(k+4, 4)
+	//	//		wb.SetCellFloat(consts.DefaultSheet, cell, results[index].Amount, 4, 64)
+	//	//	}
+	//	//	k += 5
+	//	//}
+	//}
+	//TODO: FIX
+
+	if len(results) > 0 {
+		// Обновление значений в ячейках
+		for k := 1; k < len(rows[1]); k += 5 {
+			cellValue := rows[1][k]
+
+			if index, exists := results.Contains(cellValue); exists {
+
+				if cell, err := excelize.CoordinatesToCellName(k+4, 5); err == nil {
+					wb.SetCellValue(consts.DefaultSheet, cell, shared.TruncateToFourDecimals(results[index].Amount))
+				}
+			}
 		}
 	}
 
-	for i := 5; i < len(rows[resultIndex]); i += 5 {
-		println(rows[resultIndex][i])
-		if rows[resultIndex][i] != "" {
-			cell, err := strconv.ParseFloat(rows[resultIndex][i], 64)
-			if err != nil {
-				println(rows[resultIndex][i], err)
+	// Поиск колонок с "приход" или "расход"
+	var targetColIndexes []int
+
+	if len(rows) > 2 { // Проверяем, что есть как минимум 3 строки
+		for colIndex, cellValue := range rows[2] { // Проход по строке 3 (индекс 2)
+			if cellValue == "приход" || cellValue == "расход" {
+				targetColIndexes = append(targetColIndexes, colIndex)
 			}
+		}
+	}
+
+	if len(targetColIndexes) == 0 { // Если подходящих колонок не найдено
+		return
+	}
+
+	// Очистка значений в найденных колонках
+	for _, colIndex := range targetColIndexes { // Для каждой найденной колонки
+		for rowIndex := 4; rowIndex < len(rows); rowIndex++ { // Начинаем со строки 4 (индекс 3)
+			if colIndex < len(rows[rowIndex]) { // Проверяем, что индекс колонки в пределах строки
+				cellValue := rows[rowIndex][colIndex]
+				if cellValue != "" {
+					if cellName, err := excelize.CoordinatesToCellName(colIndex+1, rowIndex+1); err == nil {
+						wb.SetCellValue(consts.DefaultSheet, cellName, nil) // Очищаем ячейку
+					}
+				}
+			}
+		}
+	}
+}
+
+func findInventRow(rows [][]string, date string) int {
+	resIndex := -1
+	resCounter := 0
+	dateIndex := findDateRow(rows, date)
+
+	for i, row := range rows[dateIndex:len(rows)] {
+		if len(row) > 0 {
+			if strings.Contains(row[0], "Инвентаризация") {
+				if resCounter == 1 {
+					resIndex = dateIndex + i + 1
+					break
+				} else {
+					resCounter++
+				}
+			}
+		}
+	}
+
+	return resIndex
+}
+
+func RunPythonSave(path string) error {
+	absPath, _ := filepath.Abs(path)
+	wd, _ := os.Getwd()
+	cmd := exec.Command("./shared/save.exe", absPath)
+	cmd.Dir = wd
+
+	//println(cmd.Dir)
+	out, err := cmd.CombinedOutput()
+
+	var res struct {
+		Success bool   `json:"success,omitempty"`
+		Error   string `json:"error,omitempty"`
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(out, &res); err != nil {
+		println(err.Error())
+	}
+
+	return err
+}
+
+func StartInventory(path string, logger *log.Logger) error {
+	wb, err := excelize.OpenFile(path)
+
+	if err != nil {
+		logger.Printf("Ошибка в открытии книги: %v", err.Error())
+		return err
+	}
+
+	rows, _ := wb.GetRows(consts.DefaultSheet)
+
+	logger.Println("Начало работы функции getLastResults")
+	products := getLastResults(rows)
+	wb.Close()
+
+	logger.Println("Начало работы функции createInventory")
+	return createInventory(products, path, logger)
+
+}
+
+func createInventory(products consts.Products, path string, logger *log.Logger) error {
+	invent := excelize.NewFile()
+	defer invent.Close()
+	var margin float64 = 0
+
+	style, _ := invent.NewStyle(&excelize.Style{
+		Font: &excelize.Font{
+			Size: float64(13),
+		},
+		Alignment: &excelize.Alignment{
+			WrapText: true,
+		},
+	})
+
+	index, _ := invent.NewSheet("Инвентаризация")
+	invent.SetActiveSheet(index)
+	err := invent.SetPageMargins("Инвентаризация", &excelize.PageLayoutMarginsOptions{
+		Left:   &margin,
+		Right:  &margin,
+		Top:    &margin,
+		Bottom: &margin,
+		Header: &margin,
+		Footer: &margin,
+	})
+	invent.SetColWidth("Инвентаризация", "A", "A", 70)
+	//invent.SetColWidth("Инвентаризация", "B", "B", 15)
+
+	if err != nil {
+		println(err.Error())
+		logger.Printf("Ошибка в выставлении стиля колонки: %s\n", err.Error())
+	}
+
+	err = invent.SetColStyle("Инвентаризация", "A", style)
+
+	if err != nil {
+		println(err.Error())
+		logger.Printf("Ошибка в выставлении стиля колонки: %s\n", err.Error())
+	}
+
+	for row, product := range products {
+		cellName, _ := excelize.CoordinatesToCellName(1, row)
+		//cellAmount, _ := excelize.CoordinatesToCellName(2, row)
+
+		if _, contains := filterProducts.Contains(product.Name); contains {
+			amount := strconv.FormatFloat(math.Floor(product.Amount*100)/100, 'f', -1, 64)
+			invent.SetCellValue("Инвентаризация", cellName, product.Name+" "+"("+amount+")")
+		} else if i, literContains := literProducts.Contains(product.Name); literContains {
+			words := strings.Split(product.Name, " ")
+			var name string
+			amount := strconv.FormatFloat(math.Floor(product.Amount*100)/100, 'f', -1, 64)
+			if len(words) < 2 {
+				name = strings.Join(words, " ") + " " + strconv.FormatFloat(literProducts[i].Amount, 'f', 1, 64) + "л" + " " + "(" + amount + ")"
+			} else {
+				name = strings.Join(words[:2], " ") + " " + strconv.FormatFloat(literProducts[i].Amount, 'f', 1, 64) + "л" + " " + "(" + amount + ")"
+			}
+			invent.SetCellValue("Инвентаризация", cellName, name)
+		} else {
+			var name string
+			words := strings.Split(product.Name, " ")
+			amount := strconv.FormatFloat(math.Floor(product.Amount*100)/100, 'f', -1, 64)
+			if len(words) < 2 {
+				name = strings.Join(words, " ") + " " + "(" + amount + ")"
+			} else {
+				name = strings.Join(words[:2], " ") + " " + "(" + amount + ")"
+			}
+			invent.SetCellValue("Инвентаризация", cellName, name)
+		}
+		//invent.SetCellValue("Инвентаризация", cellAmount, amount)
+	}
+
+	dir := filepath.Dir(path)
+	savePath := filepath.Join(dir, "Данные для инвента.xlsx")
+	invent.SaveAs(savePath)
+	return nil
+}
+
+func getLastResults(rows [][]string) consts.Products {
+	var products consts.Products
+	indexRow := -1
+
+	for k := len(rows) - 1; k >= 0; k-- {
+		if len(rows[k]) > 0 {
+			if rows[k][0] == "Итого" {
+				indexRow = k
+			}
+		}
+	}
+
+	for i := 4; i < len(rows[indexRow])-1; i += 5 {
+		if rows[indexRow][i] != "" {
+			cell, _ := strconv.ParseFloat(rows[indexRow][i], 64)
 			if cell > 0 {
 				products = append(products, consts.Product{
-					Name:     rows[1][i-4],
+					Name:     rows[1][i-3],
 					Amount:   cell,
 					IsParsed: false,
 				})
@@ -468,25 +828,4 @@ func getResults(rows [][]string, logger *log.Logger) consts.Products {
 	}
 
 	return products
-}
-
-func clearBook(wb *excelize.File, rows [][]string, results consts.Products) {
-	k := 1
-	for i := 1; i < len(rows[2]); i++ {
-		if rows[2][i] == "приход" || rows[2][i] == "расход" {
-			for j := 2; j < len(rows[2][i]); j++ {
-				if rows[j][i] != "" {
-					cell, _ := excelize.CoordinatesToCellName(i, j)
-					wb.SetCellValue(consts.DefaultSheet, cell, "")
-				}
-			}
-		}
-		if index, isContains := results.Contains(rows[1][k]); isContains {
-			cell, _ := excelize.CoordinatesToCellName(k+4, 4)
-			wb.SetCellFloat(consts.DefaultSheet, cell, results[index].Amount, 4, 64)
-		}
-		if k+5 < len(rows[1]) {
-			k += 5
-		}
-	}
 }

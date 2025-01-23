@@ -4,6 +4,7 @@ import (
 	"context"
 	"fillappgo/backend/Errors"
 	"fillappgo/backend/consts"
+	"fillappgo/backend/crypto"
 	"fillappgo/backend/processing"
 	"fillappgo/backend/readfiles"
 	"fillappgo/backend/shared"
@@ -15,6 +16,11 @@ import (
 // App struct
 type App struct {
 	ctx context.Context
+}
+
+type ProgramResponse struct {
+	Products      []string
+	GuardProducts []string
 }
 
 // Book Путь к файлу книги
@@ -65,6 +71,7 @@ func (a *App) SelectFile(dayOfWeek string) (string, error) {
 		}
 	} else if string(file[len(file)-3:]) == "xls" {
 		logger.Println("Начало работы ReadXls")
+
 		err = readfiles.ReadXls(file, logger)
 		if err != nil {
 			return "", err
@@ -97,14 +104,14 @@ func (a *App) SelectBook() (string, error) {
 	return fmt.Sprintf(file), nil
 }
 
-func (a *App) StartFill(date string) ([]string, error) {
+func (a *App) StartFill(date string) (ProgramResponse, error) {
 	err := shared.KillExcel()
 
 	logger, file := shared.OpenLogger()
 	if err != nil {
 		println(err)
 		logger.Printf("Ошибка при закрытии процесса Excel: %v\n", err)
-		return nil, fmt.Errorf(Errors.NewProgramError("2X1", "main", "Не удалось завершить работу Excel. Закройте все вкладки с Excel"))
+		return ProgramResponse{}, fmt.Errorf(Errors.NewProgramError("2X1", "main", "Не удалось завершить работу Excel. Закройте все вкладки с Excel"))
 	}
 
 	defer func() {
@@ -116,11 +123,16 @@ func (a *App) StartFill(date string) ([]string, error) {
 	}()
 
 	logger.Println("Начало работы ProcessBook")
-	if len(readfiles.Products) < 1 || len(readfiles.ProductsGuard) < 1 {
+	if len(readfiles.Products) < 1 && len(readfiles.ProductsGuard) < 1 {
 		logger.Println("Ошибка при запуске, нет продуктов")
-		return nil, fmt.Errorf(Errors.NewProgramError("2X2", "main", "Не было найдено ни одного продукта"))
+		return ProgramResponse{}, fmt.Errorf(Errors.NewProgramError("2X2", "main", "Не было найдено ни одного продукта"))
 	} else {
-		return processing.ProcessBook(Book, date, logger)
+		p, g, err := processing.ProcessBook(Book, date, logger)
+
+		return ProgramResponse{
+			Products:      p,
+			GuardProducts: g,
+		}, err
 	}
 }
 
@@ -157,13 +169,12 @@ func (a *App) ResetProducts() {
 	readfiles.StandardGuard = ""
 }
 
-func (a *App) CreateNewBook(path string) error {
+func (a *App) CreateNewBook(date string) error {
 	defer func() {
 		if err := recover(); err != nil {
 			fmt.Println(err)
 		}
 	}()
-	Book = path
 	err := shared.KillExcel()
 
 	if err != nil {
@@ -180,5 +191,29 @@ func (a *App) CreateNewBook(path string) error {
 	}()
 
 	logger.Println("Начало работы CreateNewBook")
-	return processing.CreateNewBook(Book, logger)
+	return processing.CreateNewBook(Book, date, logger)
 }
+
+func (a *App) StartInventory() error {
+	logger, file := shared.OpenLogger()
+
+	defer func() {
+		println("Закрытие файла логов")
+		err := file.Close()
+		if err != nil {
+			log.Printf("Ошибка при открытии файла логов: %v\n", err)
+		}
+	}()
+	err := shared.KillExcel()
+
+	if err != nil {
+		return fmt.Errorf(Errors.NewProgramError("5X1", "main", "Не удалось завершить работу Excel. Закройте все вкладки с Excel"))
+	}
+	return processing.StartInventory(Book, logger)
+}
+
+func (a *App) Auth(pin string) error {
+	return crypto.ComparePins(pin)
+}
+
+//

@@ -4,6 +4,7 @@ import (
 	"fillappgo/backend/consts"
 	"github.com/shirou/gopsutil/process"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -14,10 +15,7 @@ func KillExcel() error {
 		return err
 	}
 	for _, p := range processes {
-		n, err := p.Name()
-		if err != nil {
-			return err
-		}
+		n, _ := p.Name()
 		if n == consts.ExcelProcessName {
 			return p.Kill()
 		}
@@ -33,7 +31,7 @@ func OpenLogger() (*log.Logger, *os.File) {
 	}
 
 	programDir := filepath.Dir(execPath)
-	logFilePath := filepath.Join(programDir, consts.LogFileName)
+	logFilePath := filepath.Join(programDir, "shared", consts.LogFileName)
 
 	file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 
@@ -44,4 +42,8 @@ func OpenLogger() (*log.Logger, *os.File) {
 	logger := log.New(file, "INFO: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	return logger, file
+}
+
+func TruncateToFourDecimals(value float64) float64 {
+	return math.Floor(value*10000) / 10000
 }
